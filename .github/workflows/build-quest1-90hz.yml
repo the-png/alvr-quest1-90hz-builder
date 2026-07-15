@@ -1,0 +1,146 @@
+name: Build patched ALVR Quest 1 client
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  ALVR_COMMIT: e9b8e3ac62e62ad8007a7b92fb08ec33dea045ba
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the matching ALVR source
+        uses: actions/checkout@v6
+        with:
+          repository: alvr-org/ALVR
+          ref: ${{ env.ALVR_COMMIT }}
+          submodules: recursive
+          path: ALVR
+
+      - name: Install Rust Android target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Enable Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ALVR
+
+      - name: Install Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: "platforms;android-32"
+
+      - name: Install Android NDK r26b
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r26b
+
+      - name: Patch ALVR for the Quest 1 90 Hz mod
+        working-directory: ALVR
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          replacements = {
+              Path("alvr/client_openxr/src/lib.rs"): (
+          '''        let refresh_rates = if selected_exts.fb_display_refresh_rate {
+                      xr_session.enumerate_display_refresh_rates().unwrap()
+                  } else {
+                      vec![90.0]
+                  };
+          ''',
+          '''        let mut refresh_rates = if selected_exts.fb_display_refresh_rate {
+                      xr_session.enumerate_display_refresh_rates().unwrap()
+                  } else {
+                      vec![90.0]
+                  };
+
+                  // Quest 1 90 Hz kernel mod: Meta's OpenXR runtime still reports only
+                  // the stock modes, even though the display is already forced to 90 Hz.
+                  if !refresh_rates
+                      .iter()
+                      .any(|rate| (*rate - 90.0).abs() < 0.01)
+                  {
+                      refresh_rates.push(90.0);
+                  }
+
+                  info!("Advertised refresh rates (Quest 1 mod): {refresh_rates:?}");
+          '''),
+              Path("alvr/client_openxr/src/stream.rs"): (
+          '''        if xr_exts.fb_display_refresh_rate.is_some() {
+                      xr_session
+                          .request_display_refresh_rate(config.refresh_rate_hint)
+                          .unwrap();
+                  }
+          ''',
+          '''        // The patched Quest 1 is already running at 90 Hz. Do not ask the
+                  // stock OpenXR runtime to switch to an unadvertised mode, because it
+                  // may reject 90 Hz even though the panel is physically running it.
+                  if xr_exts.fb_display_refresh_rate.is_some()
+                      && (config.refresh_rate_hint - 90.0).abs() >= 0.01
+                  {
+                      xr_session
+                          .request_display_refresh_rate(config.refresh_rate_hint)
+                          .unwrap();
+                  }
+          ''')
+          }
+
+          for path, (old, new) in replacements.items():
+              text = path.read_text(encoding="utf-8")
+              if new in text:
+                  print(f"Already patched: {path}")
+                  continue
+              if old not in text:
+                  raise SystemExit(
+                      f"Expected code was not found in {path}. "
+                      "The selected ALVR commit may have changed."
+                  )
+              path.write_text(text.replace(old, new, 1), encoding="utf-8")
+              print(f"Patched: {path}")
+          PY
+
+          git diff --check
+          git diff -- alvr/client_openxr/src/lib.rs alvr/client_openxr/src/stream.rs
+
+      - name: Prepare ALVR Android dependencies
+        working-directory: ALVR
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          RUST_BACKTRACE: "1"
+        run: cargo xtask prepare-deps --platform android
+
+      - name: Build patched Quest APK
+        working-directory: ALVR/alvr/client_openxr
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          RUST_BACKTRACE: "1"
+        run: cargo xtask build-client
+
+      - name: Verify APK was created
+        run: |
+          test -f ALVR/build/alvr_client_android/alvr_client_android.apk
+          ls -lh ALVR/build/alvr_client_android/alvr_client_android.apk
+
+      - name: Upload patched APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: alvr-quest1-90hz-apk
+          path: ALVR/build/alvr_client_android/alvr_client_android.apk
+          if-no-files-found: error
